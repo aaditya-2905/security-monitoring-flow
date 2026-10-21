@@ -1,0 +1,7 @@
+{
+  "BudgetName": "sg-monitor-monthly",
+  "BudgetLimit": { "Amount": "2", "Unit": "USD" },
+  "BudgetType": "COST",
+  "TimeUnit": "MONTHLY",
+  "CostFilters": { "TagKeyValue": ["user:Project$sg-monitor"] }
+}

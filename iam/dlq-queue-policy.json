@@ -1,0 +1,15 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "EventBridgeRulesDeadLetter",
+      "Effect": "Allow",
+      "Principal": { "Service": "events.amazonaws.com" },
+      "Action": "sqs:SendMessage",
+      "Resource": "arn:aws:sqs:<HOME_REGION>:<ACCOUNT_ID>:sg-monitor-dlq",
+      "Condition": {
+        "ArnLike": { "aws:SourceArn": "arn:aws:events:<HOME_REGION>:<ACCOUNT_ID>:rule/sg-monitor-*" }
+      }
+    }
+  ]
+}

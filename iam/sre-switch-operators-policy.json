@@ -1,0 +1,28 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "OperateSwitch",
+      "Effect": "Allow",
+      "Action": ["ssm:GetParameter", "ssm:GetParameterHistory", "ssm:PutParameter"],
+      "Resource": "arn:aws:ssm:<HOME_REGION>:<ACCOUNT_ID>:parameter/secops/sg-monitor/notify-status"
+    },
+    {
+      "Sid": "ConsoleListing",
+      "Effect": "Allow",
+      "Action": "ssm:DescribeParameters",
+      "Resource": "*"
+    },
+    {
+      "Sid": "NoDestructiveActions",
+      "Effect": "Deny",
+      "Action": [
+        "ssm:DeleteParameter",
+        "ssm:DeleteParameters",
+        "ssm:LabelParameterVersion",
+        "ssm:UnlabelParameterVersion"
+      ],
+      "Resource": "arn:aws:ssm:<HOME_REGION>:<ACCOUNT_ID>:parameter/secops/sg-monitor/*"
+    }
+  ]
+}

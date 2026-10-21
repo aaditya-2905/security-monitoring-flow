@@ -1,0 +1,39 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AWSCloudTrailAclCheck",
+      "Effect": "Allow",
+      "Principal": { "Service": "cloudtrail.amazonaws.com" },
+      "Action": "s3:GetBucketAcl",
+      "Resource": "arn:aws:s3:::sg-monitor-cloudtrail-<ACCOUNT_ID>",
+      "Condition": {
+        "StringEquals": { "aws:SourceArn": "arn:aws:cloudtrail:<HOME_REGION>:<ACCOUNT_ID>:trail/sg-monitor-trail" }
+      }
+    },
+    {
+      "Sid": "AWSCloudTrailWrite",
+      "Effect": "Allow",
+      "Principal": { "Service": "cloudtrail.amazonaws.com" },
+      "Action": "s3:PutObject",
+      "Resource": "arn:aws:s3:::sg-monitor-cloudtrail-<ACCOUNT_ID>/AWSLogs/<ACCOUNT_ID>/*",
+      "Condition": {
+        "StringEquals": {
+          "s3:x-amz-acl": "bucket-owner-full-control",
+          "aws:SourceArn": "arn:aws:cloudtrail:<HOME_REGION>:<ACCOUNT_ID>:trail/sg-monitor-trail"
+        }
+      }
+    },
+    {
+      "Sid": "DenyInsecureTransport",
+      "Effect": "Deny",
+      "Principal": "*",
+      "Action": "s3:*",
+      "Resource": [
+        "arn:aws:s3:::sg-monitor-cloudtrail-<ACCOUNT_ID>",
+        "arn:aws:s3:::sg-monitor-cloudtrail-<ACCOUNT_ID>/*"
+      ],
+      "Condition": { "Bool": { "aws:SecureTransport": "false" } }
+    }
+  ]
+}

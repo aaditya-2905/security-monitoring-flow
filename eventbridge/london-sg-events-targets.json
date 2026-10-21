@@ -1,0 +1,8 @@
+[
+  {
+    "Id": "sg-monitor-lambda",
+    "Arn": "arn:aws:lambda:<HOME_REGION>:<ACCOUNT_ID>:function:sg-monitor",
+    "RetryPolicy": { "MaximumRetryAttempts": 10, "MaximumEventAgeInSeconds": 3600 },
+    "DeadLetterConfig": { "Arn": "arn:aws:sqs:<HOME_REGION>:<ACCOUNT_ID>:sg-monitor-dlq" }
+  }
+]

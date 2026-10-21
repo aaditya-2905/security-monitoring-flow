@@ -1,0 +1,17 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "InvokeMonitor",
+      "Effect": "Allow",
+      "Action": "lambda:InvokeFunction",
+      "Resource": "arn:aws:lambda:<HOME_REGION>:<ACCOUNT_ID>:function:sg-monitor"
+    },
+    {
+      "Sid": "DeadLetter",
+      "Effect": "Allow",
+      "Action": "sqs:SendMessage",
+      "Resource": "arn:aws:sqs:<HOME_REGION>:<ACCOUNT_ID>:sg-monitor-dlq"
+    }
+  ]
+}

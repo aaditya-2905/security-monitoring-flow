@@ -1,0 +1,11 @@
+{
+  "Rules": [
+    {
+      "ID": "expire-cloudtrail-logs-90d",
+      "Status": "Enabled",
+      "Filter": {},
+      "Expiration": { "Days": 90 },
+      "AbortIncompleteMultipartUpload": { "DaysAfterInitiation": 7 }
+    }
+  ]
+}

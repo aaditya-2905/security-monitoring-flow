@@ -1,0 +1,7 @@
+{
+  "Arn": "arn:aws:lambda:<HOME_REGION>:<ACCOUNT_ID>:function:sg-monitor",
+  "RoleArn": "arn:aws:iam::<ACCOUNT_ID>:role/sg-monitor-scheduler-role",
+  "Input": "{\"task\": \"switch_report\"}",
+  "RetryPolicy": { "MaximumRetryAttempts": 2, "MaximumEventAgeInSeconds": 3600 },
+  "DeadLetterConfig": { "Arn": "arn:aws:sqs:<HOME_REGION>:<ACCOUNT_ID>:sg-monitor-dlq" }
+}

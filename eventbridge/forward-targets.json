@@ -1,0 +1,7 @@
+[
+  {
+    "Id": "forward-to-home-region",
+    "Arn": "arn:aws:events:<HOME_REGION>:<ACCOUNT_ID>:event-bus/default",
+    "RoleArn": "arn:aws:iam::<ACCOUNT_ID>:role/sg-monitor-event-forwarder"
+  }
+]

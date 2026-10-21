@@ -1,0 +1,12 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "RequireMFAToFlipSwitch",
+      "Effect": "Deny",
+      "Action": "ssm:PutParameter",
+      "Resource": "arn:aws:ssm:<HOME_REGION>:<ACCOUNT_ID>:parameter/secops/sg-monitor/notify-status",
+      "Condition": { "BoolIfExists": { "aws:MultiFactorAuthPresent": "false" } }
+    }
+  ]
+}

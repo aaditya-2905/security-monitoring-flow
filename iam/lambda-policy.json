@@ -1,0 +1,41 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "WriteOwnLogs",
+      "Effect": "Allow",
+      "Action": ["logs:CreateLogStream", "logs:PutLogEvents"],
+      "Resource": "arn:aws:logs:<HOME_REGION>:<ACCOUNT_ID>:log-group:/aws/lambda/sg-monitor:*"
+    },
+    {
+      "Sid": "ReadNetworkInventory",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:DescribeSecurityGroups",
+        "ec2:DescribeSecurityGroupRules",
+        "ec2:DescribeNetworkInterfaces",
+        "ec2:DescribeInstances",
+        "ec2:GetManagedPrefixListEntries"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "ReadSwitch",
+      "Effect": "Allow",
+      "Action": ["ssm:GetParameter", "ssm:GetParameterHistory"],
+      "Resource": "arn:aws:ssm:<HOME_REGION>:<ACCOUNT_ID>:parameter/secops/sg-monitor/notify-status"
+    },
+    {
+      "Sid": "ReadChangeHistory",
+      "Effect": "Allow",
+      "Action": "cloudtrail:LookupEvents",
+      "Resource": "*"
+    },
+    {
+      "Sid": "OnFailureDestination",
+      "Effect": "Allow",
+      "Action": "sqs:SendMessage",
+      "Resource": "arn:aws:sqs:<HOME_REGION>:<ACCOUNT_ID>:sg-monitor-dlq"
+    }
+  ]
+}

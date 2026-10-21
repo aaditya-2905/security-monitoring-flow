@@ -1,0 +1,11 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ForwardToHomeRegionBus",
+      "Effect": "Allow",
+      "Action": "events:PutEvents",
+      "Resource": "arn:aws:events:<HOME_REGION>:<ACCOUNT_ID>:event-bus/default"
+    }
+  ]
+}
