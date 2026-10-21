@@ -658,6 +658,8 @@ def run_daily_scan():
         title, color = f"🛡️ Daily SG scan: {crit} CRITICAL exposure(s)", "Attention"
     elif findings:
         title, color = f"🛡️ Daily SG scan: {len(findings)} open port finding(s)", "Warning"
+    elif errors:
+        title, color = "🛡️ Daily SG scan: ⚠️ incomplete, some regions could not be scanned", "Attention"
     else:
         title, color = "🛡️ Daily SG scan: ✅ no critical ports open to the internet", "Good"
 
@@ -866,6 +868,7 @@ def _resume_body(versions, findings, scan_errors, changes, change_errors):
         body.append(tb("⚠️ Change history incomplete: " + "; ".join(change_errors[:5]), color="Warning"))
     body.append(tb("**Catch-up scan:** " + ("🔴 critical exposure found" if crit else
                                              f"{len(findings)} finding(s)" if findings else
+                                             "⚠️ incomplete" if scan_errors else
                                              "✅ no critical ports open to the internet"),
                    weight="Bolder", color="Attention" if crit else "Default"))
     if scan_errors:
@@ -882,12 +885,12 @@ def handle_switch_change(event):
             title_block("🔴 Alert switch was DELETED", "Attention"),
             tb(f"{SWITCH_PARAM} no longer exists. Real-time alerts are forced ON (fail-safe). "
                "Recreate it with the setup command from the deployment guide. "
-               "Check CloudTrail (DeleteParameter in eu-west-2) for who deleted it."),
+               f"Check CloudTrail (DeleteParameter in {HOME_REGION}) for who deleted it."),
             tb("**Catch-up scan:**", weight="Bolder"),
         ]
         if errors:
             body.append(tb("🔴 Could not scan: " + "; ".join(errors), color="Attention"))
-        body += finding_blocks(findings) or [tb("✅ no critical ports open to the internet")]
+        body += finding_blocks(findings) or ([] if errors else [tb("✅ no critical ports open to the internet")])
         post_to_teams(body)
         return {"status": "deleted_alerted"}
 

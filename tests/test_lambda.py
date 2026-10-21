@@ -297,6 +297,17 @@ class FlowTests(Base):
         self.assertEqual(out["errors"], ["ap-south-1: UnauthorizedOperation"])
         self.assertIn("Could not scan", card_text(self.posts[0]))
 
+    def test_daily_scan_with_errors_and_no_findings_is_not_reported_clean(self):
+        class Broken(FakeEC2):
+            def get_paginator(self, op):
+                raise ClientError("UnauthorizedOperation")
+        FAKES[("ec2", "eu-west-2")] = FakeEC2()
+        FAKES[("ec2", "ap-south-1")] = Broken()
+        lf.lambda_handler({"task": "daily_scan"}, None)
+        text = card_text(self.posts[0])
+        self.assertIn("incomplete", text)
+        self.assertNotIn("✅", text)
+
     def test_switch_report_off_shows_duration_person_and_reason(self):
         FAKES[("ssm", "eu-west-2")] = FakeSSM([version(1, "ON", "admin", -600),
                                                version(2, "OFF", "rahul", 0, "CHG-1234 DB patching")])

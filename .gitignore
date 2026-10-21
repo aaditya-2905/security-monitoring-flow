@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Build artifacts (Lambda package and upload bundle)
+function.zip
+sg-monitor.zip
+*.zip
+
+# Secrets: the Teams webhook URL must never be committed
+.env
+.env.*
+env.json
+dlq-attrs.json
+
+# Lambda invoke output
+out.json
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store

@@ -36,15 +36,15 @@ This guide sets up alerts in Microsoft Teams whenever a Security Group opens a s
 ## Step 0: Get ready (5 min)
 
 1. **Sign in** to the AWS Console as an admin user **with MFA**, and switch the region to **Europe (London) eu-west-2**.
-2. **Upload the project.** On your machine, zip the project and leave the tests out:
+2. **Upload the project.** On your machine, zip the project and leave the tests and git history out:
    ```bash
-   cd ~ && zip -r sg-monitor.zip sg-monitor -x 'sg-monitor/tests/*' '*/__pycache__/*'
+   cd ~ && zip -r sg-monitor.zip sg-monitor -x 'sg-monitor/tests/*' 'sg-monitor/.git/*' '*/__pycache__/*'
    ```
 3. **Open CloudShell** (the `>_` icon in the console's top bar). Choose **Actions → Upload file → sg-monitor.zip**, then run:
    ```bash
    unzip -o sg-monitor.zip && cd ~/sg-monitor
    ```
-4. **Set the variables.** Edit the four `EDIT` lines in `config/vars.sh` (`nano config/vars.sh`), then run:
+4. **Set the variables.** Edit the three `EDIT` lines in `config/vars.sh` (`nano config/vars.sh`), then run:
    ```bash
    source config/vars.sh
    ```
@@ -464,6 +464,19 @@ aws sqs delete-queue --queue-url $DLQ_URL --region $HOME_REGION
 aws sns delete-topic --topic-arn $SNS_ARN --region $HOME_REGION
 aws ssm delete-parameter --name /secops/sg-monitor/notify-status --region $HOME_REGION
 aws budgets delete-budget --account-id $ACCOUNT_ID --budget-name sg-monitor-monthly
-# IAM roles and group: detach/delete their inline policies first, then delete-role / delete-group.
+aws logs delete-log-group --log-group-name /aws/lambda/sg-monitor --region $HOME_REGION
+
+aws iam delete-role-policy --role-name sg-monitor-lambda-role --policy-name sg-monitor-lambda
+aws iam delete-role --role-name sg-monitor-lambda-role
+aws iam delete-role-policy --role-name sg-monitor-scheduler-role --policy-name sg-monitor-scheduler
+aws iam delete-role --role-name sg-monitor-scheduler-role
+aws iam delete-role-policy --role-name sg-monitor-event-forwarder --policy-name sg-monitor-forwarder
+aws iam delete-role --role-name sg-monitor-event-forwarder
+for u in $SRE_USERS; do aws iam remove-user-from-group --group-name sg-monitor-operators --user-name "$u"; done
+aws iam delete-group-policy --group-name sg-monitor-operators --policy-name sg-monitor-switch
+aws iam delete-group-policy --group-name sg-monitor-operators --policy-name sg-monitor-require-mfa 2>/dev/null
+aws iam detach-group-policy --group-name sg-monitor-operators --policy-arn arn:aws:iam::aws:policy/AWSCloudShellFullAccess
+aws iam delete-group --group-name sg-monitor-operators
+# Forwarding rules added in extra regions (optional hardening in 8b): repeat the forward-rule loop for those regions.
 # CloudTrail trail and bucket: delete only if this guide created them.
 ```
