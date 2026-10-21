@@ -93,14 +93,24 @@ class FakeEC2:
 
 
 class FakeSSM:
-    def __init__(self, versions=None, missing=False):
+    def __init__(self, versions=None, missing=False, read_error=None, put_error=None):
         self.versions = versions or []
         self.missing = missing
+        self.read_error = read_error
+        self.put_error = put_error
+        self.puts = []
 
     def get_parameter(self, Name):
+        if self.read_error:
+            raise ClientError(self.read_error)
         if self.missing or not self.versions:
             raise ClientError("ParameterNotFound")
         return {"Parameter": {"Value": self.versions[-1]["Value"]}}
+
+    def put_parameter(self, **kw):
+        if self.put_error:
+            raise ClientError(self.put_error)
+        self.puts.append(kw)
 
     def get_parameter_history(self, Name, MaxResults=50, NextToken=None):
         start = int(NextToken or 0)
@@ -109,18 +119,6 @@ class FakeSSM:
         if start + MaxResults < len(self.versions):
             resp["NextToken"] = str(start + MaxResults)
         return resp
-
-
-class FakeCloudTrail:
-    def __init__(self, events=None):
-        self.events = events or []
-
-    def get_paginator(self, op):
-        def lookup_events(LookupAttributes, StartTime, EndTime, **kw):
-            name = LookupAttributes[0]["AttributeValue"]
-            return {"Events": [{"CloudTrailEvent": json.dumps(e)} for e in self.events
-                               if e["eventName"] == name and StartTime <= lf.parse_iso(e["eventTime"]) <= EndTime]}
-        return FakePaginator(lookup_events)
 
 
 # ---- fixtures ------------------------------------------------------------------------------
@@ -180,8 +178,6 @@ class Base(unittest.TestCase):
         FAKES[("ec2", "eu-west-2")] = world_ec2()
         FAKES[("ec2", "ap-south-1")] = FakeEC2()
         FAKES[("ssm", "eu-west-2")] = FakeSSM([version(1, "ON", "admin", -600, "Initial setup")])
-        FAKES[("cloudtrail", "eu-west-2")] = FakeCloudTrail()
-        FAKES[("cloudtrail", "ap-south-1")] = FakeCloudTrail()
 
 
 # ---- pure helpers --------------------------------------------------------------------------
@@ -279,14 +275,23 @@ class SwitchTests(Base):
 # ---- end-to-end flows ----------------------------------------------------------------------
 
 class FlowTests(Base):
-    def test_daily_scan_posts_findings_and_maintenance_banner(self):
-        FAKES[("ssm", "eu-west-2")] = FakeSSM([version(1, "OFF", "rahul", 0, "CHG-1")])
+    def test_daily_scan_posts_findings(self):
         out = lf.lambda_handler({"task": "daily_scan"}, None)
         self.assertEqual(out["findings"], 1)
         text = card_text(self.posts[0])
         self.assertIn("CRITICAL", text)
-        self.assertIn("Maintenance mode is ON", text)
         self.assertNotIn("http://evil", text)
+
+    def test_daily_scan_skipped_when_switch_off(self):
+        FAKES[("ssm", "eu-west-2")] = FakeSSM([version(1, "OFF", "rahul", 0, "CHG-1")])
+        del FAKES[("ec2", "eu-west-2")]  # any scan attempt would now fail
+        self.assertEqual(lf.lambda_handler({"task": "daily_scan"}, None)["status"], "skipped_maintenance")
+        self.assertEqual(self.posts, [])
+
+    def test_daily_scan_clean_posts_nothing(self):
+        FAKES[("ec2", "eu-west-2")] = FakeEC2()
+        self.assertEqual(lf.lambda_handler({"task": "daily_scan"}, None)["status"], "clean")
+        self.assertEqual(self.posts, [])
 
     def test_daily_scan_reports_region_failure(self):
         class Broken(FakeEC2):
@@ -297,33 +302,60 @@ class FlowTests(Base):
         self.assertEqual(out["errors"], ["ap-south-1: UnauthorizedOperation"])
         self.assertIn("Could not scan", card_text(self.posts[0]))
 
-    def test_daily_scan_with_errors_and_no_findings_is_not_reported_clean(self):
+    def test_daily_scan_with_errors_and_no_findings_fails_without_posting(self):
         class Broken(FakeEC2):
             def get_paginator(self, op):
                 raise ClientError("UnauthorizedOperation")
         FAKES[("ec2", "eu-west-2")] = FakeEC2()
         FAKES[("ec2", "ap-south-1")] = Broken()
-        lf.lambda_handler({"task": "daily_scan"}, None)
-        text = card_text(self.posts[0])
-        self.assertIn("incomplete", text)
-        self.assertNotIn("✅", text)
+        with self.assertRaises(RuntimeError):
+            lf.lambda_handler({"task": "daily_scan"}, None)
+        self.assertEqual(self.posts, [])
 
-    def test_switch_report_off_shows_duration_person_and_reason(self):
-        FAKES[("ssm", "eu-west-2")] = FakeSSM([version(1, "ON", "admin", -600),
-                                               version(2, "OFF", "rahul", 0, "CHG-1234 DB patching")])
+    def test_switch_check_on_does_nothing(self):
+        ssm = FAKES[("ssm", "eu-west-2")]
+        self.assertEqual(lf.lambda_handler({"task": "switch_check"}, None)["status"], "on")
+        self.assertEqual(ssm.puts, [])
+        self.assertEqual(self.posts, [])
+
+    def test_switch_check_turns_off_back_on_and_posts(self):
+        ssm = FakeSSM([version(1, "ON", "admin", -600),
+                       version(2, "OFF", "rahul", 0, "CHG-1234 DB patching")])
+        FAKES[("ssm", "eu-west-2")] = ssm
         lf.now_utc = lambda: T0 + timedelta(hours=16, minutes=40)
         try:
-            lf.lambda_handler({"task": "switch_report"}, None)
+            out = lf.lambda_handler({"task": "switch_check"}, None)
         finally:
             lf.now_utc = lambda: datetime.now(timezone.utc)
+        self.assertEqual(out["status"], "reset_posted")
+        self.assertEqual(ssm.puts[0]["Value"], "ON")
+        self.assertTrue(ssm.puts[0]["Overwrite"])
         text = card_text(self.posts[0])
-        self.assertIn("Maintenance is going on from the past 16h 40m. Please be aware.", text)
+        self.assertIn("turned back ON", text)
         self.assertIn("rahul", text)
+        self.assertIn("16h 40m", text)
         self.assertIn("CHG-1234 DB patching", text)
 
-    def test_switch_report_on(self):
-        lf.lambda_handler({"task": "switch_report"}, None)
-        self.assertIn("real-time alerts are ON", card_text(self.posts[0]))
+    def test_switch_check_restores_missing_switch(self):
+        ssm = FakeSSM(missing=True)
+        FAKES[("ssm", "eu-west-2")] = ssm
+        self.assertEqual(lf.lambda_handler({"task": "switch_check"}, None)["previous"], "MISSING")
+        self.assertEqual(ssm.puts[0]["Value"], "ON")
+        self.assertIn("MISSING", card_text(self.posts[0]))
+
+    def test_switch_check_unreadable_switch_fails_without_writing(self):
+        ssm = FakeSSM(read_error="AccessDeniedException")
+        FAKES[("ssm", "eu-west-2")] = ssm
+        with self.assertRaises(RuntimeError):
+            lf.lambda_handler({"task": "switch_check"}, None)
+        self.assertEqual(ssm.puts, [])
+        self.assertEqual(self.posts, [])
+
+    def test_switch_check_reset_failure_does_not_post(self):
+        FAKES[("ssm", "eu-west-2")] = FakeSSM([version(1, "OFF", "rahul", 0)], put_error="AccessDeniedException")
+        with self.assertRaises(ClientError):
+            lf.lambda_handler({"task": "switch_check"}, None)
+        self.assertEqual(self.posts, [])
 
     def test_sg_event_alerts_new_critical_rule(self):
         ev = cloudtrail_event("AuthorizeSecurityGroupIngress", {"groupId": SG_DB},
@@ -374,49 +406,14 @@ class FlowTests(Base):
                                                    "allocationId": "eipalloc-1"})
         self.assertEqual(lf.lambda_handler(ev, None)["status"], "alerted")
 
-    def test_switch_paused(self):
-        FAKES[("ssm", "eu-west-2")] = FakeSSM([version(1, "ON", "admin", -600, "Resumed"),
-                                               version(2, "OFF", "rahul", 0, "CHG-1234")])
-        ev = {"source": "aws.ssm", "detail-type": "Parameter Store Change",
-              "detail": {"operation": "Update", "name": "/secops/sg-monitor/notify-status"}}
-        self.assertEqual(lf.lambda_handler(ev, None)["status"], "paused_posted")
-        text = card_text(self.posts[0])
-        self.assertIn("PAUSED", text)
-        self.assertIn("rahul", text)
-        self.assertIn("CHG-1234", text)
-
-    def test_switch_resumed_lists_changes_and_runs_catch_up_scan(self):
-        FAKES[("ssm", "eu-west-2")] = FakeSSM([version(1, "ON", "admin", -600, "Resumed"),
-                                               version(2, "OFF", "rahul", 0, "CHG-1234"),
-                                               version(3, "ON", "priya", 195, "Resumed")])
-        FAKES[("cloudtrail", "eu-west-2")] = FakeCloudTrail([
-            {"eventName": "AuthorizeSecurityGroupIngress", "eventTime": "2026-10-21T09:30:00Z",
-             "userIdentity": {"type": "IAMUser", "userName": "rahul"},
-             "requestParameters": {"groupId": SG_DB}},
-            {"eventName": "AuthorizeSecurityGroupIngress", "eventTime": "2026-10-20T09:30:00Z",  # before pause
-             "userIdentity": {"type": "IAMUser", "userName": "old"}, "requestParameters": {"groupId": SG_DB}},
-        ])
-        ev = {"source": "aws.ssm", "detail-type": "Parameter Store Change",
-              "detail": {"operation": "Update", "name": "/secops/sg-monitor/notify-status"}}
-        self.assertEqual(lf.lambda_handler(ev, None)["status"], "resumed_posted")
-        text = card_text(self.posts[0])
-        self.assertIn("RESUMED", text)
-        self.assertIn("priya", text)
-        self.assertIn("3h 15m", text)
-        self.assertIn("Changes made during the pause (1)", text)
-        self.assertNotIn("· old ·", text)
-        self.assertIn("critical exposure found", text)
-
-    def test_switch_deleted(self):
-        ev = {"source": "aws.ssm", "detail-type": "Parameter Store Change",
-              "detail": {"operation": "Delete", "name": "/secops/sg-monitor/notify-status"}}
-        self.assertEqual(lf.lambda_handler(ev, None)["status"], "deleted_alerted")
-        self.assertIn("DELETED", card_text(self.posts[0]))
-
     def test_unknown_event_rejected(self):
         self.assertEqual(lf.lambda_handler({"source": "custom.attacker"}, None)["status"], "ignored")
+        # Switch changes no longer trigger anything: the SG events themselves are what get checked.
         self.assertEqual(lf.lambda_handler({"source": "aws.ssm", "detail-type": "Parameter Store Change",
-                                            "detail": {"name": "/other"}}, None)["status"], "ignored")
+                                            "detail": {"operation": "Update",
+                                                       "name": "/secops/sg-monitor/notify-status"}},
+                                           None)["status"], "ignored")
+        self.assertEqual(self.posts, [])
 
 
 class TeamsPostTests(unittest.TestCase):

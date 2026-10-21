@@ -5,31 +5,32 @@ This guide sets up alerts in Microsoft Teams whenever a Security Group opens a s
 ## What you are building
 
 ```
- Server regions (other than London)               London (eu-west-2): home region
- ┌──────────────────────────────┐               ┌───────────────────────────────────────────────┐
- │ CloudTrail → EventBridge rule │──forward──►  │ default event bus                              │
- │ "sg-monitor-forward-to-home"  │               │   rule sg-monitor-sg-events ───────┐           │
- └──────────────────────────────┘               │   rule sg-monitor-switch-change ───┤           │
-                                                 │ Scheduler 10:00 IST daily_scan ────┤           │
-                                                 │ Scheduler 07:00 + 19:00 IST report ┤           │
-                                                 │                                    ▼           │
-                                                 │            Lambda "sg-monitor" (read-only)     │
-                                                 │   reads switch: SSM /secops/sg-monitor/notify-status
-                                                 │            │                     │ on failure  │
-                                                 │            ▼                     ▼             │
-                                                 │   Teams Workflow webhook   SQS sg-monitor-dlq  │
-                                                 │                            + CloudWatch alarms → SNS email
-                                                 └───────────────────────────────────────────────┘
+ Other server regions                         London (eu-west-2): home region
+ CloudTrail → EventBridge rule ──forward──►   default event bus
+ "sg-monitor-forward-to-home"                   rule sg-monitor-sg-events ─────────────┐
+                                                Scheduler 10:00 IST        daily_scan ─┤
+                                                Scheduler 07:00 + 19:00 IST switch_check┤
+                                                                                       ▼
+                                                Lambda "sg-monitor"
+                                                  reads the switch (and resets it to ON):
+                                                  SSM /secops/sg-monitor/notify-status
+                                                        │                    │ on failure
+                                                        ▼                    ▼
+                                                Teams Workflow webhook   SQS sg-monitor-dlq
+                                                                         + CloudWatch alarms → SNS email
 ```
 
 | Flow | Trigger | Behaviour |
 |---|---|---|
-| Daily scan | 10:00 IST | Scans every SG in the 3 server regions. **Always runs**, whether alerts are paused or not. Posts findings, or "✅ nothing open" as a daily sign that monitoring is working. |
-| Real-time check | SG / ENI / instance / public IP change | When the switch is **ON**: alerts if a critical port became reachable from the internet, naming the IAM user who did it. When **OFF**: the event is logged as `SKIPPED (maintenance)` and no alert is sent. |
-| Switch report | 07:00 and 19:00 IST | ON: "✅ monitoring active". OFF: "⚠️ Maintenance is going on from the past Xh Ym. Please be aware." |
-| Switch change | An SRE runs the ON or OFF command | OFF: "⏸️ paused by X". ON: "▶️ resumed by X", plus the SG changes made during the pause and a full catch-up scan. |
+| Daily scan | 10:00 IST | Checks the switch first. **OFF**: skipped (logged as `SKIPPED (maintenance)`), nothing is scanned. **ON**: scans every SG in the server regions and posts to Teams **only if** a port is open to the internet. Nothing is posted on clean days. |
+| Real-time check | SG / ENI / instance / public IP change | **ON**: alerts if a critical port became reachable from the internet, naming the IAM user who did it. **OFF**: the event is logged as `SKIPPED (maintenance)` and no alert is sent. |
+| Switch check | 07:00 and 19:00 IST | **ON**: nothing happens. **OFF**: the Lambda sets the switch back to **ON** and posts "🔄 SG monitoring switch turned back ON" with who turned it off, when and why. |
 
-**Fail-safe:** if the switch is missing, unreadable or holds any value other than `OFF`, the Lambda behaves as if it were **ON** and flags the problem in Teams.
+Teams only gets two kinds of message: **a port open to the internet** (real-time or daily scan) and **the switch turned back ON** because someone left it OFF. Turning the switch OFF or ON by hand posts nothing.
+
+**Maintenance order:** turn the switch **OFF first**, then change the Security Groups. Changes made while it is OFF are not alerted in real time; if they leave a port open, the next daily scan after the switch is back ON reports it.
+
+**Fail-safe:** if the switch is missing or holds any value other than `OFF`, the Lambda behaves as if it were **ON**, and the next switch check restores it to `ON` (with a Teams message). If the switch can't be read at all, the Lambda fails and the errors alarm emails you.
 
 ---
 
@@ -166,7 +167,7 @@ aws sns subscribe --topic-arn $SNS_ARN --protocol email --notification-endpoint 
 ## Step 6: Create the IAM roles (3 min)
 
 ```bash
-# Lambda: read-only inventory, read the switch, read CloudTrail history, logs, DLQ
+# Lambda: read-only inventory, read the switch and reset it to ON, logs, DLQ
 aws iam create-role --role-name sg-monitor-lambda-role \
   --assume-role-policy-document file://iam/lambda-trust.json --tags Key=Project,Value=sg-monitor
 aws iam put-role-policy --role-name sg-monitor-lambda-role \
@@ -187,7 +188,7 @@ aws iam put-role-policy --role-name sg-monitor-event-forwarder \
 sleep 15   # let IAM propagate before the Lambda uses the role
 ```
 
-**Security note:** the Lambda can't change any Security Group, instance or the switch. It only reads.
+**Security note:** the Lambda can't change any Security Group or instance. The only thing it can write is the switch parameter, which it sets back to `ON`.
 
 ---
 
@@ -212,7 +213,6 @@ sleep 15   # let IAM propagate before the Lambda uses the role
        "SWITCH_PARAM_NAME": "/secops/sg-monitor/notify-status",
        "ALLOWLIST": "",
        "ALERT_ANY_PUBLIC_PORT": "false",
-       "POST_WHEN_CLEAN": "true",
        "TZ_OFFSET_MINUTES": "330",
        "TZ_LABEL": "IST"
    }}))
@@ -248,11 +248,10 @@ sleep 15   # let IAM propagate before the Lambda uses the role
 
 | Variable | Meaning | Example |
 |---|---|---|
-| `MONITORED_REGIONS` | Regions for the daily and catch-up scans | `eu-west-2,ap-south-1,us-east-1` |
+| `MONITORED_REGIONS` | Regions for the daily scan | `eu-west-2,ap-south-1,us-east-1` |
 | `ALLOWLIST` | Ports allowed to be public: `<sg-id or *>:<port or range or *>` | `sg-0abc:443,sg-0abc:80,*:41641` |
 | `CRITICAL_PORTS` | Overrides the built-in list of 31 sensitive ports | `22:SSH,3389:RDP,6379:Redis` |
 | `ALERT_ANY_PUBLIC_PORT` | `true` also reports non-critical public ports | `false` |
-| `POST_WHEN_CLEAN` | Post "✅ nothing open" on clean days (acts as a heartbeat) | `true` |
 
 > ⚠️ `update-function-configuration --environment` **replaces all** variables. To change one, open the Console (**Lambda → sg-monitor → Configuration → Environment variables → Edit**) and edit just that one.
 >
@@ -262,7 +261,7 @@ sleep 15   # let IAM propagate before the Lambda uses the role
 
 ## Step 8: Wire up the triggers (5 min)
 
-**8a. London rules: real-time SG events and switch changes, sent to the Lambda**
+**8a. London rule: real-time SG events, sent to the Lambda**
 ```bash
 aws events put-rule --name sg-monitor-sg-events --region $HOME_REGION \
   --event-pattern file://eventbridge/sg-events-pattern.json --tags Key=Project,Value=sg-monitor
@@ -272,16 +271,8 @@ aws lambda add-permission --function-name sg-monitor --region $HOME_REGION \
   --source-arn arn:aws:events:$HOME_REGION:$ACCOUNT_ID:rule/sg-monitor-sg-events
 aws events put-targets --rule sg-monitor-sg-events --region $HOME_REGION \
   --targets file://eventbridge/london-sg-events-targets.json
-
-aws events put-rule --name sg-monitor-switch-change --region $HOME_REGION \
-  --event-pattern file://eventbridge/switch-change-pattern.json --tags Key=Project,Value=sg-monitor
-aws lambda add-permission --function-name sg-monitor --region $HOME_REGION \
-  --statement-id eventbridge-switch-change --action lambda:InvokeFunction \
-  --principal events.amazonaws.com \
-  --source-arn arn:aws:events:$HOME_REGION:$ACCOUNT_ID:rule/sg-monitor-switch-change
-aws events put-targets --rule sg-monitor-switch-change --region $HOME_REGION \
-  --targets file://eventbridge/london-switch-targets.json
 ```
+Switch changes deliberately have **no** rule: flipping the switch triggers nothing. Only the SG changes themselves are checked.
 
 **8b. Other server regions: forward SG events to London**
 ```bash
@@ -306,18 +297,18 @@ aws scheduler create-schedule --name sg-monitor-daily-scan --region $HOME_REGION
   --schedule-expression "cron(0 10 * * ? *)" --schedule-expression-timezone "Asia/Kolkata" \
   --flexible-time-window '{"Mode":"OFF"}' --target file://scheduler/daily-scan-target.json
 
-aws scheduler create-schedule --name sg-monitor-switch-report --region $HOME_REGION \
+aws scheduler create-schedule --name sg-monitor-switch-check --region $HOME_REGION \
   --schedule-expression "cron(0 7,19 * * ? *)" --schedule-expression-timezone "Asia/Kolkata" \
-  --flexible-time-window '{"Mode":"OFF"}' --target file://scheduler/switch-report-target.json
+  --flexible-time-window '{"Mode":"OFF"}' --target file://scheduler/switch-check-target.json
 ```
 
-**Security note:** nobody can fake the real-time events. EventBridge refuses `PutEvents` calls that use an `aws.*` source, so only AWS itself can emit them. The Lambda's resource policy also allows only these two rules to invoke it, and the Scheduler role is the only other caller.
+**Security note:** nobody can fake the real-time events. EventBridge refuses `PutEvents` calls that use an `aws.*` source, so only AWS itself can emit them. The Lambda's resource policy also allows only this rule to invoke it, and the Scheduler role is the only other caller.
 
 ---
 
 ## Step 9: Alarms and budget (5 min)
 
-These three alarms tell you by email when the monitoring itself breaks:
+These three alarms tell you by email when the monitoring itself breaks. Problems that never reach Teams (a daily scan that couldn't scan a region and found nothing, an unreadable switch, a failed switch reset) make the Lambda fail on purpose, so `sg-monitor-lambda-errors` catches them:
 ```bash
 aws cloudwatch put-metric-alarm --region $HOME_REGION --alarm-name sg-monitor-lambda-errors \
   --namespace AWS/Lambda --metric-name Errors --dimensions Name=FunctionName,Value=sg-monitor \
@@ -356,21 +347,18 @@ aws cloudwatch put-metric-alarm --region $HOME_REGION --alarm-name sg-monitor-no
 
 ## Step 10: Test every flow (15 min)
 
-Run these in order and check the Teams channel after each one.
-
-**T1: Daily scan.** Expect a "🛡️ Daily SG scan" card listing findings, or ✅ if nothing is open.
+Run these in order and check the Teams channel after each one. `INVOKE` is a shortcut for running a task by hand:
 ```bash
-aws lambda invoke --function-name sg-monitor --region $HOME_REGION \
-  --cli-binary-format raw-in-base64-out --payload '{"task":"daily_scan"}' /tmp/out.json && cat /tmp/out.json
+INVOKE() { aws lambda invoke --function-name sg-monitor --region $HOME_REGION \
+  --cli-binary-format raw-in-base64-out --payload "{\"task\":\"$1\"}" /tmp/out.json >/dev/null && cat /tmp/out.json; echo; }
 ```
 
-**T2: Switch report.** Expect "✅ SG monitoring is active".
+**T1: Switch check while ON.** Expect `{"status": "on"}` and **no** Teams message.
 ```bash
-aws lambda invoke --function-name sg-monitor --region $HOME_REGION \
-  --cli-binary-format raw-in-base64-out --payload '{"task":"switch_report"}' /tmp/out.json && cat /tmp/out.json
+INVOKE switch_check
 ```
 
-**T3: Real-time alert.** This uses a throwaway SG that isn't attached to anything, so nothing is actually exposed. Run it in one region from another region to also prove forwarding works; replace `ap-south-1` with one of your `OTHER_REGIONS`.
+**T2: Real-time alert.** This uses a throwaway SG that isn't attached to anything, so nothing is actually exposed. Run it in one region from another region to also prove forwarding works; replace `ap-south-1` with one of your `OTHER_REGIONS`.
 ```bash
 TR=ap-south-1
 VPC=$(aws ec2 describe-vpcs --region $TR --query 'Vpcs[0].VpcId' --output text)
@@ -380,34 +368,51 @@ aws ec2 authorize-security-group-ingress --region $TR --group-id $SG --protocol 
 ```
 Within 1–2 minutes, expect **🟠 "Port opened to the internet"** with: your IAM user name, `22 (SSH)`, and *"Not attached to any server yet"*.
 
-**T4: Pause, change during the pause, resume.**
-1. **Pause.** Run the **OFF** command from `SRE_RUNBOOK.md` with reason `test`. Expect **⏸️ PAUSED by \<you\>**.
-2. **Make a change while paused:**
+**T3: Daily scan.** Expect a **"🛡️ Daily SG scan"** card that lists the test SG's port 22 (plus anything else already open). On a clean account the scan posts nothing and returns `{"status": "clean"}`.
+```bash
+INVOKE daily_scan
+```
+
+**T4: Maintenance window left OFF.**
+1. **Turn alerts OFF.** Run the **OFF** command from `SRE_RUNBOOK.md` with reason `test`. **No** Teams message is expected.
+2. **Make a change while OFF:**
    ```bash
    aws ec2 authorize-security-group-ingress --region $TR --group-id $SG --protocol tcp --port 3306 --cidr 0.0.0.0/0
    ```
-   No Teams alert should appear. The logs should show the skip:
+   No Teams alert should appear. After a minute or two, the logs should show the skip:
    ```bash
    aws logs tail /aws/lambda/sg-monitor --since 10m --region $HOME_REGION | grep SKIPPED
    ```
-3. **Report while paused.** Run the T2 command again. Expect "⚠️ Maintenance is going on from the past 0h Xm…".
-4. **Resume.** Wait about 15 minutes (CloudTrail history lag), then run the **ON** command. Expect **▶️ RESUMED** with:
-   - the pause duration
-   - the 3306 change listed under "Changes made during the pause"
-   - a catch-up scan showing the test SG's 22 and 3306 rules
+3. **Daily scan while OFF.** Expect `{"status": "skipped_maintenance"}` and no Teams message:
+   ```bash
+   INVOKE daily_scan
+   ```
+4. **Switch check while OFF** (this is what happens at 07:00/19:00 when someone forgets to turn alerts back ON). Expect `{"status": "reset_posted", ...}` and **🔄 "SG monitoring switch turned back ON"** naming you, the time and reason `test`. Then confirm the switch reads `ON`:
+   ```bash
+   INVOKE switch_check
+   aws ssm get-parameter --region $HOME_REGION --name /secops/sg-monitor/notify-status --query Parameter.Value --output text
+   ```
+5. **Daily scan after the reset.** Expect a card listing the test SG's 22 **and** 3306: the change made during maintenance is caught here.
+   ```bash
+   INVOKE daily_scan
+   ```
 
-**T5: Clean up.**
+**T5: Failure path (optional, while the test SG is still open).** In the Lambda console, temporarily change `TEAMS_WEBHOOK_URL` to `https://example.invalid/x`. Then invoke the daily scan **asynchronously**, like the schedules do. Only an async invoke goes through the retries and the dead-letter queue:
 ```bash
-aws ec2 delete-security-group --region $TR --group-id $SG
+aws lambda invoke --function-name sg-monitor --region $HOME_REGION --invocation-type Event \
+  --cli-binary-format raw-in-base64-out --payload '{"task":"daily_scan"}' /tmp/out.json
 ```
-
-**T6: Failure path (optional).** In the Lambda console, temporarily change `TEAMS_WEBHOOK_URL` to `https://example.invalid/x` and run T2.
 - Expect the **sg-monitor-lambda-errors** alarm email within about 5 minutes.
-- After the retries, a message lands in the dead-letter queue and **sg-monitor-dlq-not-empty** fires as well.
+- After the 2 retries (a few minutes), a message lands in the dead-letter queue and **sg-monitor-dlq-not-empty** fires as well.
 - Restore the URL afterwards and purge the queue:
   ```bash
   aws sqs purge-queue --queue-url $DLQ_URL --region $HOME_REGION
   ```
+
+**T6: Clean up.**
+```bash
+aws ec2 delete-security-group --region $TR --group-id $SG
+```
 
 ---
 
@@ -426,8 +431,10 @@ aws lambda update-function-code --function-name sg-monitor --zip-file fileb://fu
 | Alerts for the London region only | The forwarding rules from 8b are missing in the other regions, or the `sg-monitor-event-forwarder` role is wrong. Check *FailedInvocations* on the forwarding rule. |
 | Rule matched but nothing in Teams | Search the Lambda logs for `RuntimeError`. Is the webhook URL correct, and is the Teams workflow still turned on and owned by an active account? |
 | `AccessDenied` in the logs | Compare the role policy with `iam/lambda-policy.json`. |
-| Report says "switch MISSING" | Re-run Step 3. |
+| "Switch turned back ON" says the switch was MISSING | Someone deleted it; the Lambda recreated it as `ON`. Check CloudTrail for `DeleteParameter`. |
+| Errors alarm fired but nothing in Teams | Search the Lambda logs for `RuntimeError`: `Daily scan incomplete` (a region could not be scanned), `Cannot read switch` (fix SSM permissions), or a failed `PutParameter` during the switch check. |
 | Daily scan says "Could not scan: \<region\>" | The region is disabled for the account, or there's an IAM problem. The message shows the error code. |
+| No daily scan card | Expected when nothing is open, or when the switch was OFF at 10:00 (log shows `SKIPPED (maintenance)`). |
 | A legitimate public port keeps alerting | Add it to `ALLOWLIST`, for example `sg-0abc123:443`. |
 | A duplicate alert now and then | Expected: EventBridge delivers at least once. |
 
@@ -437,7 +444,7 @@ aws lambda update-function-code --function-name sg-monitor --zip-file fileb://fu
 |---|---|
 | Lambda (about 1,100 invocations, 600 GB-seconds) | ~$0.01 |
 | EventBridge rules, AWS events, Scheduler, cross-region forwarding | ~$0.00 |
-| SSM Standard parameter, CloudTrail LookupEvents | $0.00 |
+| SSM Standard parameter | $0.00 |
 | CloudWatch Logs (30 days) + 3 alarms | ~$0.31 (alarms are free within the free tier of 10) |
 | SQS / SNS | ~$0.00 |
 | CloudTrail trail, only if newly created (S3 writes + storage with a 90-day expiry) | ~$0.20–0.40 |
@@ -449,15 +456,13 @@ These are list prices. Before sign-off, confirm them in the AWS Pricing Calculat
 
 ```bash
 aws scheduler delete-schedule --name sg-monitor-daily-scan --region $HOME_REGION
-aws scheduler delete-schedule --name sg-monitor-switch-report --region $HOME_REGION
+aws scheduler delete-schedule --name sg-monitor-switch-check --region $HOME_REGION
 for R in $OTHER_REGIONS; do
   aws events remove-targets --rule sg-monitor-forward-to-home --ids forward-to-home-region --region $R
   aws events delete-rule --name sg-monitor-forward-to-home --region $R
 done
-for RULE in sg-monitor-sg-events sg-monitor-switch-change; do
-  aws events remove-targets --rule $RULE --ids sg-monitor-lambda --region $HOME_REGION
-  aws events delete-rule --name $RULE --region $HOME_REGION
-done
+aws events remove-targets --rule sg-monitor-sg-events --ids sg-monitor-lambda --region $HOME_REGION
+aws events delete-rule --name sg-monitor-sg-events --region $HOME_REGION
 aws lambda delete-function --function-name sg-monitor --region $HOME_REGION
 aws cloudwatch delete-alarms --alarm-names sg-monitor-lambda-errors sg-monitor-dlq-not-empty sg-monitor-not-running --region $HOME_REGION
 aws sqs delete-queue --queue-url $DLQ_URL --region $HOME_REGION

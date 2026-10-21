@@ -1,7 +1,6 @@
 # SG alerts: maintenance on/off (SRE runbook)
 
-Before maintenance that changes Security Groups, **turn alerts OFF**. When you're done, **turn them back ON**.
-Teams announces both changes with your name, so everyone knows what's going on.
+Before maintenance that changes Security Groups, **turn alerts OFF first**, then make your changes. When you're done, **turn them back ON**.
 
 ## How to run a command
 
@@ -17,9 +16,9 @@ Teams announces both changes with your name, so everyone knows what's going on.
 read -rp "Reason for maintenance (optional, press Enter to skip): " R; aws ssm put-parameter --region eu-west-2 --name /secops/sg-monitor/notify-status --type String --overwrite --allowed-pattern '^(ON|OFF)$' --value OFF --description "${R:-no reason given}"
 ```
 
-You'll be asked for a reason. Type something like `CHG-1234 DB patching`, or just press Enter to skip.
+You'll be asked for a reason. Type something like `CHG-1234 DB patching`, or just press Enter to skip. The reason is shown in Teams if the switch has to be turned back ON automatically.
 
-**Teams shows:** ⏸️ *SG alerts PAUSED*, with your name, the time and the reason.
+**Teams shows:** nothing.
 
 ---
 
@@ -29,18 +28,19 @@ You'll be asked for a reason. Type something like `CHG-1234 DB patching`, or jus
 aws ssm put-parameter --region eu-west-2 --name /secops/sg-monitor/notify-status --type String --overwrite --allowed-pattern '^(ON|OFF)$' --value ON --description "Maintenance finished"
 ```
 
-**Teams shows:** ▶️ *SG alerts RESUMED*, with your name, how long the pause lasted, the SG changes made during it and a fresh scan of open ports.
+**Teams shows:** nothing.
 
 ---
 
 ## Good to know
 
 - **The output looks like `{"Version": 7, "Tier": "Standard"}`.** That means it worked.
-- **The switch is global.** OFF pauses real-time alerts for **all** servers in **all** regions.
+- **The switch is global.** OFF pauses alerts for **all** servers in **all** regions.
 - **While alerts are OFF:**
-  - The 10:00 daily scan still runs.
-  - A reminder is posted at 07:00 and 19:00 saying how long maintenance has been running.
-- **Don't forget to turn alerts back ON.** Until you do, the reminders keep coming.
+  - SG changes are **not** alerted in real time.
+  - The 10:00 daily scan is **skipped**.
+- **Automatic reset at 07:00 and 19:00 IST.** If the switch is still OFF at either time, it is turned back ON and Teams shows 🔄 *SG monitoring switch turned back ON*, with your name, how long it was off and your reason. **If your maintenance runs past 07:00 or 19:00, turn alerts OFF again** right after that time.
+- **Ports left open during maintenance are not lost.** Once alerts are ON again, the next 10:00 daily scan reports anything open to the internet.
 - **`AccessDenied`** means you're not in the `sg-monitor-operators` group, or you signed in without MFA. Ask the platform admin.
 - **Optional: check the current state:**
   ```bash

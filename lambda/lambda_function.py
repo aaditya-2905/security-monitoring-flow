@@ -2,22 +2,25 @@
 SG Monitor - one Lambda that alerts Microsoft Teams about Security Group exposure.
 
 Triggers (routed in lambda_handler):
-  1. EventBridge Scheduler {"task": "daily_scan"}      10:00 IST full scan. Always runs, ignores the switch.
-  2. EventBridge Scheduler {"task": "switch_report"}   07:00 / 19:00 IST switch status report.
-  3. EventBridge rule, CloudTrail event (aws.ec2)       Real-time SG check. Skipped while the switch is OFF.
-  4. EventBridge rule, Parameter Store Change (aws.ssm) Switch flipped: pause notice / resume + catch-up scan.
+  1. EventBridge Scheduler {"task": "daily_scan"}     10:00 IST full scan. Skipped while the switch is OFF.
+                                                     Posts to Teams only when something is open.
+  2. EventBridge rule, CloudTrail event (aws.ec2)      Real-time SG check. Skipped while the switch is OFF.
+  3. EventBridge Scheduler {"task": "switch_check"}   07:00 / 19:00 IST. If the switch was left OFF (or is
+                                                     missing / invalid), sets it back to ON and tells Teams.
+
+Teams therefore only hears about two things: a port open to the internet, and the switch being
+turned back ON because someone left it OFF.
 
 The switch is the SSM parameter SWITCH_PARAM_NAME ("ON" / "OFF"). Anything other than an exact,
 readable "OFF" is treated as ON (fail-safe), so a broken switch can never silence alerts.
 
 Environment variables:
   TEAMS_WEBHOOK_URL       (required) Teams Workflows "webhook request received" URL.
-  MONITORED_REGIONS       (required) Comma-separated regions for the daily / catch-up scans.
+  MONITORED_REGIONS       (required) Comma-separated regions for the daily scan.
   SWITCH_PARAM_NAME       default /secops/sg-monitor/notify-status
   CRITICAL_PORTS          optional override, e.g. "22:SSH,3389:RDP,6379" (name optional).
   ALLOWLIST               optional, e.g. "sg-0abc:443,sg-0abc:80,*:41641,sg-0def:8000-8100".
   ALERT_ANY_PUBLIC_PORT   "true" to also report non-critical ports open to the internet. Default false.
-  POST_WHEN_CLEAN         "false" to skip the daily message when nothing is open. Default true.
   TZ_OFFSET_MINUTES       default 330 (IST, UTC+05:30, no DST).
   TZ_LABEL                default IST.
 """
@@ -53,12 +56,10 @@ def _env_list(name, default=""):
 
 MONITORED_REGIONS = _env_list("MONITORED_REGIONS", HOME_REGION)
 ALERT_ANY_PUBLIC_PORT = _env_bool("ALERT_ANY_PUBLIC_PORT", False)
-POST_WHEN_CLEAN = _env_bool("POST_WHEN_CLEAN", True)
-TZ = timezone(timedelta(minutes=int(os.environ.get("TZ_OFFSET_MINUTES", "330"))))
+TZ =timezone(timedelta(minutes=int(os.environ.get("TZ_OFFSET_MINUTES", "330"))))
 TZ_LABEL = os.environ.get("TZ_LABEL", "IST")
 
 MAX_FINDINGS_IN_CARD = 25
-MAX_CHANGES_IN_CARD = 20
 
 DEFAULT_CRITICAL_PORTS = {
     21: "FTP", 22: "SSH", 23: "Telnet", 135: "MS-RPC", 139: "NetBIOS", 445: "SMB",
@@ -109,9 +110,6 @@ ATTACH_EVENTS = {"ModifyNetworkInterfaceAttribute", "ModifyInstanceAttribute"}
 SG_EVENTS = RULE_EVENTS | ATTACH_EVENTS | {
     "CreateNetworkInterface", "RunInstances", "AssociateAddress", "ModifyManagedPrefixList",
 }
-# Looked up in CloudTrail history to summarise what changed during a maintenance pause.
-PAUSE_LOOKUP_EVENTS = sorted(SG_EVENTS | {"RevokeSecurityGroupIngress", "CreateSecurityGroup",
-                                           "DeleteSecurityGroup"})
 
 _BOTO_CFG = Config(retries={"max_attempts": 8, "mode": "adaptive"},
                    connect_timeout=5, read_timeout=20)
@@ -544,12 +542,11 @@ def pause_info(versions, end_idx=None):
 
 
 def switch_banner(switch):
-    """One line for cards whose behaviour depends on the switch, or None when it is plainly ON."""
-    if switch["state"] == "OFF":
-        return "⚠️ Maintenance mode is ON: real-time SG alerts are paused. This scan still runs."
+    """Warning line for alert cards when the switch is broken (alerts are only sent while it counts
+    as ON), or None when it is plainly ON."""
     if switch["state"] != "ON":
         return (f"🔴 Alert switch is {switch['state']} ({switch.get('detail', '')}). "
-                "Treating it as ON (fail-safe). Fix the switch parameter.")
+                "Treating it as ON (fail-safe). It is restored to ON at the next 07:00 / 19:00 check.")
     return None
 
 
@@ -642,32 +639,35 @@ def post_to_teams(body):
 
 
 # --------------------------------------------------------------------------------------------
-# Flow 1: daily scan (10:00 IST) - always runs, ignores the switch
+# Flow 1: daily scan (10:00 IST) - skipped while the switch is OFF, posts only when something is open
 # --------------------------------------------------------------------------------------------
 
 def run_daily_scan():
     switch = read_switch()
+    if not switch["on"]:
+        log("SKIPPED (maintenance)", task="daily_scan")
+        return {"status": "skipped_maintenance"}
+
     findings, errors = scan_all_regions()
     log("daily_scan", findings=len(findings), errors=errors, switch=switch["state"],
         details=findings)
-    if not findings and not errors and not POST_WHEN_CLEAN:
+    if not findings:
+        if errors:
+            # Nothing goes to Teams, so fail the invocation: the Lambda errors alarm emails the team.
+            raise RuntimeError("Daily scan incomplete: " + "; ".join(errors))
         return {"status": "clean", "posted": False}
 
     crit = sum(f["severity"] == "CRITICAL" for f in findings)
     if crit:
         title, color = f"🛡️ Daily SG scan: {crit} CRITICAL exposure(s)", "Attention"
-    elif findings:
-        title, color = f"🛡️ Daily SG scan: {len(findings)} open port finding(s)", "Warning"
-    elif errors:
-        title, color = "🛡️ Daily SG scan: ⚠️ incomplete, some regions could not be scanned", "Attention"
     else:
-        title, color = "🛡️ Daily SG scan: ✅ no critical ports open to the internet", "Good"
+        title, color = f"🛡️ Daily SG scan: {len(findings)} open port finding(s)", "Warning"
 
     body = [title_block(title, color),
             tb(f"{fmt_time(now_utc())} · Regions: {', '.join(MONITORED_REGIONS)}", isSubtle=True)]
     banner = switch_banner(switch)
     if banner:
-        body.append(tb(banner, color="Warning", weight="Bolder"))
+        body.append(tb(banner, color="Attention", weight="Bolder"))
     if errors:
         body.append(tb("🔴 Could not scan: " + "; ".join(errors) + ". Results for these regions are missing.",
                        color="Attention", weight="Bolder"))
@@ -677,46 +677,58 @@ def run_daily_scan():
 
 
 # --------------------------------------------------------------------------------------------
-# Flow 3: switch status report (07:00 / 19:00 IST)
+# Flow 3: switch check (07:00 / 19:00 IST) - turns a switch left OFF back ON
 # --------------------------------------------------------------------------------------------
 
-def run_switch_report():
+def set_switch_on(previous_state):
+    client("ssm").put_parameter(
+        Name=SWITCH_PARAM, Value="ON", Type="String", Overwrite=True,
+        AllowedPattern="^(ON|OFF)$",
+        Description=f"Auto-reset to ON by sg-monitor (was {previous_state})",
+    )
+
+
+def run_switch_check():
     switch = read_switch()
-    body = []
+    if switch["state"] == "ON":
+        log("switch_check", state="ON")
+        return {"status": "on"}
+    if switch["state"] == "ERROR":
+        # Unreadable (e.g. AccessDenied): don't overwrite blindly. Fail so the errors alarm emails the team.
+        raise RuntimeError(f"Cannot read switch {SWITCH_PARAM}: {switch.get('detail')}")
+
+    info = None
     if switch["state"] == "OFF":
         try:
             info = pause_info(switch_history())
-            since = fmt_duration(now_utc() - info["at"]) if info["at"] else "an unknown time"
-            body = [
-                title_block(f"⚠️ Maintenance is going on from the past {since}. Please be aware.", "Warning"),
-                facts([
-                    ("Paused by", clean(info["by"])),
-                    ("Paused at", fmt_time(info["at"])),
-                    ("Reason", info["reason"] or "no reason given"),
-                    ("Status", "Real-time SG alerts are OFF for all regions. The 10:00 daily scan still runs."),
-                ]),
+        except Exception as e:
+            log("switch_history_failed", error=str(e))
+    set_switch_on(switch["state"])
+    log("switch_reset", previous=switch["state"], pause=info)
+
+    if switch["state"] == "OFF":
+        if info:
+            pause_facts = [
+                ("Turned OFF by", clean(info["by"])),
+                ("Turned OFF at", fmt_time(info["at"])),
+                ("OFF for", fmt_duration(now_utc() - info["at"]) if info["at"] else ""),
+                ("Reason", info["reason"] or "no reason given"),
             ]
-        except Exception as e:
-            log("switch_history_failed", error=str(e))
-            body = [title_block("⚠️ Maintenance mode is ON: real-time SG alerts are paused. Please be aware.", "Warning"),
-                    tb("Could not read who paused it or since when (parameter history unavailable).", isSubtle=True)]
-    elif switch["state"] == "ON":
-        body = [title_block("✅ SG monitoring is active: real-time alerts are ON.", "Good")]
-        try:
-            versions = switch_history()
-            if versions:
-                last = versions[-1]
-                body.append(tb(f"Last switch change: {clean(actor_from_arn(last.get('LastModifiedUser')))} "
-                               f"at {fmt_time(last.get('LastModifiedDate'))}", isSubtle=True))
-        except Exception as e:
-            log("switch_history_failed", error=str(e))
+        else:
+            pause_facts = [("Turned OFF by", "unknown (parameter history unavailable)")]
+        why = "The switch was left OFF after maintenance, so sg-monitor turned it back ON automatically."
     else:
-        body = [title_block(f"🔴 Alert switch is {switch['state']}", "Attention"),
-                tb(f"Detail: {switch.get('detail', '')}. Alerts are being treated as ON (fail-safe). "
-                   f"Recreate or fix the parameter {SWITCH_PARAM}.")]
-    body.insert(1, tb(fmt_time(now_utc()), isSubtle=True))
-    post_to_teams(body)
-    return {"status": "posted", "switch": switch["state"]}
+        pause_facts = [("Switch was", f"{switch['state']} ({switch.get('detail', '')})")]
+        why = "The switch parameter was missing or invalid, so sg-monitor restored it to ON."
+
+    post_to_teams([
+        title_block("🔄 SG monitoring switch turned back ON", "Warning"),
+        tb(fmt_time(now_utc()), isSubtle=True),
+        facts(pause_facts),
+        tb(why + " Real-time SG alerts and the 10:00 daily scan are active again. "
+           "If maintenance is still going on, turn alerts OFF again (SRE runbook)."),
+    ])
+    return {"status": "reset_posted", "previous": switch["state"]}
 
 
 # --------------------------------------------------------------------------------------------
@@ -795,164 +807,6 @@ def handle_sg_event(event):
 
 
 # --------------------------------------------------------------------------------------------
-# Flow 4: switch changed (pause / resume / deleted)
-# --------------------------------------------------------------------------------------------
-
-def changes_during(start, end):
-    """SG-related changes recorded in CloudTrail event history between start and end
-    (free API, ~2 requests/second per region, events can take up to ~15 minutes to appear)."""
-    changes, errors = [], []
-    for region in MONITORED_REGIONS:
-        ct = client("cloudtrail", region)
-        for event_name in PAUSE_LOOKUP_EVENTS:
-            try:
-                pages = ct.get_paginator("lookup_events").paginate(
-                    LookupAttributes=[{"AttributeKey": "EventName", "AttributeValue": event_name}],
-                    StartTime=start, EndTime=end + timedelta(minutes=1),
-                    PaginationConfig={"MaxItems": 50},
-                )
-                for page in pages:
-                    for ev in page.get("Events", []):
-                        try:
-                            record = json.loads(ev.get("CloudTrailEvent") or "{}")
-                        except ValueError:
-                            continue
-                        if record.get("errorCode"):
-                            continue
-                        ids = extract_ids(record.get("requestParameters"))
-                        if event_name in ATTACH_EVENTS and not ids["sg"]:
-                            continue
-                        refs = sorted(ids["sg"] | ids["i"] | ids["eni"] | ids["pl"])
-                        changes.append({
-                            "time": parse_iso(record.get("eventTime")) or ev.get("EventTime"),
-                            "region": region,
-                            "by": actor_from_identity(record.get("userIdentity")),
-                            "action": event_name,
-                            "resources": ", ".join(refs[:4]) + (" ..." if len(refs) > 4 else ""),
-                        })
-                    time.sleep(0.5)  # stay under the LookupEvents rate limit
-            except ClientError as e:
-                errors.append(f"{region}/{event_name}: {e.response.get('Error', {}).get('Code')}")
-    changes.sort(key=lambda c: c["time"] or start)
-    return changes, errors
-
-
-def _resume_body(versions, findings, scan_errors, changes, change_errors):
-    latest_idx = len(versions) - 1
-    latest = versions[latest_idx]
-    paused = pause_info(versions, latest_idx - 1)
-    resumed_at = latest.get("LastModifiedDate")
-    duration = fmt_duration(resumed_at - paused["at"]) if (resumed_at and paused["at"]) else "unknown"
-    crit = any(f["severity"] == "CRITICAL" for f in findings)
-    body = [
-        title_block("▶️ SG alerts RESUMED", "Good"),
-        facts([
-            ("Resumed by", clean(actor_from_arn(latest.get("LastModifiedUser")))),
-            ("Resumed at", fmt_time(resumed_at)),
-            ("Paused by", clean(paused["by"])),
-            ("Paused for", f"{duration} (since {fmt_time(paused['at'])})"),
-            ("Pause reason", paused["reason"] or "no reason given"),
-        ]),
-        tb(f"**Changes made during the pause ({len(changes)})**", weight="Bolder"),
-    ]
-    for c in changes[:MAX_CHANGES_IN_CARD]:
-        body.append(tb(f"{fmt_time(c['time'])} · {c['region']} · {clean(c['by'], 60)} · "
-                       f"{c['action']} · {clean(c['resources'], 120)}", spacing="None"))
-    if len(changes) > MAX_CHANGES_IN_CARD:
-        body.append(tb(f"... and {len(changes) - MAX_CHANGES_IN_CARD} more (see CloudTrail).", isSubtle=True))
-    if not changes:
-        body.append(tb("None recorded.", spacing="None"))
-    body.append(tb("CloudTrail can take up to ~15 minutes to show an event, so very recent changes may be "
-                   "missing above. The catch-up scan below checks the live state.", isSubtle=True))
-    if change_errors:
-        body.append(tb("⚠️ Change history incomplete: " + "; ".join(change_errors[:5]), color="Warning"))
-    body.append(tb("**Catch-up scan:** " + ("🔴 critical exposure found" if crit else
-                                             f"{len(findings)} finding(s)" if findings else
-                                             "⚠️ incomplete" if scan_errors else
-                                             "✅ no critical ports open to the internet"),
-                   weight="Bolder", color="Attention" if crit else "Default"))
-    if scan_errors:
-        body.append(tb("🔴 Could not scan: " + "; ".join(scan_errors), color="Attention"))
-    body += finding_blocks(findings)
-    return body
-
-
-def handle_switch_change(event):
-    operation = (event.get("detail") or {}).get("operation", "")
-    if operation == "Delete":
-        findings, errors = scan_all_regions()
-        body = [
-            title_block("🔴 Alert switch was DELETED", "Attention"),
-            tb(f"{SWITCH_PARAM} no longer exists. Real-time alerts are forced ON (fail-safe). "
-               "Recreate it with the setup command from the deployment guide. "
-               f"Check CloudTrail (DeleteParameter in {HOME_REGION}) for who deleted it."),
-            tb("**Catch-up scan:**", weight="Bolder"),
-        ]
-        if errors:
-            body.append(tb("🔴 Could not scan: " + "; ".join(errors), color="Attention"))
-        body += finding_blocks(findings) or ([] if errors else [tb("✅ no critical ports open to the internet")])
-        post_to_teams(body)
-        return {"status": "deleted_alerted"}
-
-    if operation not in ("Create", "Update"):
-        log("switch_event_ignored", operation=operation)
-        return {"status": "ignored"}
-
-    versions = switch_history()
-    if not versions:
-        return {"status": "no_history"}
-    latest = versions[-1]
-    new_value = latest.get("Value")
-    old_value = versions[-2].get("Value") if len(versions) > 1 else None
-    by = clean(actor_from_arn(latest.get("LastModifiedUser")))
-    at = fmt_time(latest.get("LastModifiedDate"))
-
-    if new_value == "OFF" and old_value != "OFF":
-        info = pause_info(versions)
-        body = [
-            title_block("⏸️ SG alerts PAUSED (maintenance)", "Warning"),
-            facts([
-                ("Paused by", by),
-                ("Paused at", at),
-                ("Reason", info["reason"] or "no reason given"),
-            ]),
-            tb("Real-time SG alerts are OFF for all regions. The 10:00 daily scan still runs, and a "
-               "reminder is posted at 07:00 and 19:00 until alerts are resumed."),
-        ]
-        post_to_teams(body)
-        return {"status": "paused_posted"}
-
-    if new_value == "ON" and old_value == "OFF":
-        paused = pause_info(versions, len(versions) - 2)
-        changes, change_errors = changes_during(paused["at"], latest.get("LastModifiedDate") or now_utc())
-        findings, scan_errors = scan_all_regions()
-        log("resume_catch_up", changes=len(changes), findings=len(findings),
-            change_errors=change_errors, scan_errors=scan_errors)
-        post_to_teams(_resume_body(versions, findings, scan_errors, changes, change_errors))
-        return {"status": "resumed_posted"}
-
-    if new_value not in ("ON", "OFF"):
-        post_to_teams([title_block(f"🔴 Alert switch set to an invalid value by {by}", "Attention"),
-                       tb(f"Value: {clean(new_value, 40)}. Alerts are treated as ON (fail-safe). "
-                          "Set it to exactly ON or OFF.")])
-        return {"status": "invalid_posted"}
-
-    if operation == "Create":
-        post_to_teams([title_block(f"ℹ️ Alert switch created by {by}", "Accent"),
-                       tb(f"Initial value: {new_value} · {at}")])
-        return {"status": "created_posted"}
-
-    if new_value == "OFF":  # OFF re-saved, typically to update the reason
-        reason = _fresh_reason(versions, len(versions) - 1)
-        if reason:
-            post_to_teams([title_block("⏸️ Maintenance pause updated", "Warning"),
-                           facts([("Updated by", by), ("At", at), ("New reason", reason)])])
-            return {"status": "pause_updated_posted"}
-    log("switch_resaved_same_value", value=new_value, by=by)
-    return {"status": "no_state_change"}
-
-
-# --------------------------------------------------------------------------------------------
 # Entry point
 # --------------------------------------------------------------------------------------------
 
@@ -964,16 +818,12 @@ def lambda_handler(event, context):
     task = event.get("task")
     if task == "daily_scan":
         return run_daily_scan()
-    if task == "switch_report":
-        return run_switch_report()
+    if task == "switch_check":
+        return run_switch_check()
 
     source, detail_type = event.get("source"), event.get("detail-type")
     if source == "aws.ec2" and detail_type == "AWS API Call via CloudTrail":
         return handle_sg_event(event)
-    if source == "aws.ssm" and detail_type == "Parameter Store Change":
-        name = ((event.get("detail") or {}).get("name") or "").lstrip("/")
-        if name == SWITCH_PARAM.lstrip("/"):
-            return handle_switch_change(event)
 
     log("rejected_unknown_event", source=source, detail_type=detail_type, keys=sorted(event)[:10])
     return {"status": "ignored"}

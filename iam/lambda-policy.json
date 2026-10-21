@@ -20,16 +20,10 @@
       "Resource": "*"
     },
     {
-      "Sid": "ReadSwitch",
+      "Sid": "ReadAndResetSwitch",
       "Effect": "Allow",
-      "Action": ["ssm:GetParameter", "ssm:GetParameterHistory"],
+      "Action": ["ssm:GetParameter", "ssm:GetParameterHistory", "ssm:PutParameter"],
       "Resource": "arn:aws:ssm:<HOME_REGION>:<ACCOUNT_ID>:parameter/secops/sg-monitor/notify-status"
-    },
-    {
-      "Sid": "ReadChangeHistory",
-      "Effect": "Allow",
-      "Action": "cloudtrail:LookupEvents",
-      "Resource": "*"
     },
     {
       "Sid": "OnFailureDestination",
